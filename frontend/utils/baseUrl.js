@@ -1,0 +1,1 @@
+export default 'https://collaborative-whiteboard-app.herokuapp.com'

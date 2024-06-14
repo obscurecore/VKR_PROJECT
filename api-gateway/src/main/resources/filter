@@ -1,0 +1,123 @@
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.actuate.health.HealthIndicator;
+import org.springframework.boot.actuate.health.Status;
+import org.springframework.cloud.client.discovery.DiscoveryClient;
+import org.springframework.cloud.gateway.filter.GatewayFilter;
+import org.springframework.cloud.gateway.filter.GatewayFilterChain;
+import org.springframework.cloud.gateway.route.RouteLocator;
+import org.springframework.cloud.gateway.route.builder.RouteLocatorBuilder;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.Ordered;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Configuration
+public class GatewayConfiguration {
+
+    @Autowired
+    private DiscoveryClient discoveryClient;
+
+    @Autowired
+    private MeterRegistry meterRegistry;
+
+    @Bean
+    public RouteLocator customRouteLocator(RouteLocatorBuilder builder) {
+        return builder.routes()
+                .route("product-service", r -> r.path("/api/product")
+                        .uri("lb://product-service")
+                        .filters(f -> f.filter(dynamicRoutingFilter()))
+                )
+                .route("order-service", r -> r.path("/api/order")
+                        .uri("lb://order-service")
+                        .filters(f -> f.filter(dynamicRoutingFilter()))
+                )
+                .build();
+    }
+
+    // Фильтр для динамической балансировки
+    @Bean
+    public GatewayFilter dynamicRoutingFilter() {
+        return (exchange, chain) -> {
+            String routeId = exchange.getRoute().getId();
+            String serviceName = routeId.replace("-service", "");
+
+            // Получаем список доступных инстанций сервиса
+            List<String> instances = discoveryClient.getInstances(serviceName);
+
+            // Создаем кэш для хранения времен отклика
+            Map<String, Long> responseTimes = new ConcurrentHashMap<>();
+
+            // Проверяем доступность сервисов
+            if (instances.isEmpty()) {
+                return Mono.error(new RuntimeException("Service not found: " + serviceName));
+            }
+
+            // Выбираем инстанцию с наименьшим временем отклика
+            String selectedInstance = instances.stream()
+                    .min((i1, i2) -> Long.compare(responseTimes.getOrDefault(i1, Long.MAX_VALUE),
+                            responseTimes.getOrDefault(i2, Long.MAX_VALUE)))
+                    .orElseThrow(() -> new RuntimeException("No instances found for: " + serviceName));
+
+            // Запрашиваем метрику 'http.server.requests'
+            meterRegistry.get("http.server.requests")
+                    .tags("method", "GET", "uri", "/api/" + serviceName)
+                    .counter().increment();
+
+            // Замеряем время отклика
+            long startTime = System.currentTimeMillis();
+
+            // Перенаправляем запрос на выбранную инстанцию
+            ServerHttpRequest request = exchange.getRequest().mutate()
+                    .uri(instances.get(0)) // Замените на selectedInstance при необходимости
+                    .build();
+            ServerWebExchange mutatedExchange = exchange.mutate().request(request).build();
+
+            // Перехватываем ответ и обновляем кэш времен отклика
+            return chain.filter(mutatedExchange).doOnSuccess(response -> {
+                long endTime = System.currentTimeMillis();
+                responseTimes.put(selectedInstance, endTime - startTime);
+            });
+        };
+    }
+
+    // Индикатор здоровья для сервисов
+    @Bean
+    public HealthIndicator healthIndicator() {
+        return () -> {
+            Map<String, Object> details = new ConcurrentHashMap<>();
+            discoveryClient.getServices().forEach(serviceId -> {
+                List<String> instances = discoveryClient.getInstances(serviceId);
+                details.put(serviceId, instances.isEmpty() ? Status.DOWN : Status.UP);
+            });
+            return new HealthIndicator.Builder()
+                    .withDetails(details)
+                    .status(Status.UP)
+                    .build();
+        };
+    }
+
+    // Фильтр для проверки доступности сервисов (необязательно)
+    @Bean
+    public GatewayFilter availabilityCheckFilter() {
+        return (exchange, chain) -> {
+            String routeId = exchange.getRoute().getId();
+            String serviceName = routeId.replace("-service", "");
+
+            // Проверяем доступность сервиса
+            if (discoveryClient.getInstances(serviceName).isEmpty()) {
+                return Mono.error(new RuntimeException("Service not found: " + serviceName));
+            }
+
+            // Перенаправляем запрос
+            return chain.filter(exchange);
+        };
+    }
+}
